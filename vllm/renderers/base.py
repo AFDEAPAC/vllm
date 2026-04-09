@@ -108,13 +108,12 @@ class BaseRenderer(ABC, Generic[_T]):
         if config.model_config.is_multimodal_model:
             mm_processor_cache = mm_registry.processor_cache_from_config(config)
 
-            # NOTE: Deep-copy disabled for Gemma 4 compatibility.
-            # Gemma 4's Rust tokenizer panics on deepcopy ("Already borrowed"
-            # from RefCell). Sharing the tokenizer is safe when
-            # AsyncMicrobatchTokenizer is not used concurrently with
-            # call_hf_processor.
-            # Original: mm_tokenizer = copy.deepcopy(tokenizer)
-            mm_tokenizer = tokenizer
+            # Deep-copy the tokenizer so the multimodal processor gets its
+            # own Rust tokenizer backend.  Without this, concurrent access
+            # from AsyncMicrobatchTokenizer and call_hf_processor causes
+            # "RuntimeError: Already borrowed" from the Rust RefCell.
+            # See: https://github.com/huggingface/tokenizers/issues/537
+            mm_tokenizer = copy.deepcopy(tokenizer)
 
             with set_default_torch_num_threads():
                 self.mm_processor = mm_registry.create_processor(
