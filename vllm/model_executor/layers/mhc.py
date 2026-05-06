@@ -11,8 +11,10 @@ from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# tilelang is only available on CUDA platforms
-if TYPE_CHECKING or current_platform.is_cuda_alike():
+# tilelang is only available on CUDA platforms. ROCm uses the torch fallback
+# paths below and should not import tilelang because its TVM dependency may
+# attempt to load CUDA-only torch extensions.
+if TYPE_CHECKING or current_platform.is_cuda():
     if not has_tilelang():
         raise ImportError(
             "tilelang is required for mhc but is not installed. Install it with "
@@ -21,8 +23,26 @@ if TYPE_CHECKING or current_platform.is_cuda_alike():
     import tilelang
     import tilelang.language as T
 else:
-    tilelang = None  # type: ignore[assignment]
-    T = None  # type: ignore[assignment]
+    class _TileLangStub:
+        class PassConfigKey:
+            TL_DISABLE_WARP_SPECIALIZED = "TL_DISABLE_WARP_SPECIALIZED"
+            TL_DISABLE_TMA_LOWER = "TL_DISABLE_TMA_LOWER"
+            TL_PTXAS_REGISTER_USAGE_LEVEL = "TL_PTXAS_REGISTER_USAGE_LEVEL"
+
+        JITKernel = object
+
+        @staticmethod
+        def jit(*args, **kwargs):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+    class _TStub:
+        pass
+
+    tilelang = _TileLangStub()  # type: ignore[assignment]
+    T = _TStub()  # type: ignore[assignment]
 
 
 @cache
