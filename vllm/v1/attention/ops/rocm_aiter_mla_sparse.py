@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -923,6 +924,28 @@ def rocm_ref_sparse_attn_prefill(
             0
         ) >= topk_length.unsqueeze(1)
         indices[mask] = -1
+
+    q_chunk_size = int(os.environ.get("VLLM_DSV4_REF_PREFILL_Q_CHUNK", "128"))
+    if q_chunk_size > 0 and s_q > q_chunk_size:
+        out = torch.empty((s_q, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
+        for chunk_start in range(0, s_q, q_chunk_size):
+            chunk_end = min(chunk_start + q_chunk_size, s_q)
+            chunk_topk_length = (
+                topk_length[chunk_start:chunk_end]
+                if topk_length is not None
+                else None
+            )
+            out[chunk_start:chunk_end] = rocm_ref_sparse_attn_prefill(
+                q=q[chunk_start:chunk_end],
+                kv=kv,
+                indices=indices[chunk_start:chunk_end].unsqueeze(1),
+                topk_length=chunk_topk_length,
+                scale=scale,
+                head_dim=head_dim,
+                attn_sink=attn_sink,
+            )
+        return out
+
     invalid_mask = (indices < 0) | (indices >= s_kv)
     indices[invalid_mask] = 0
 
