@@ -111,8 +111,8 @@ def quantize_and_insert_k_kernel(
             x_scaled = x / scale
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8, then bitcast to uint8 for storage
-            x_fp8 = x_clamped.to(tl.float8e4nv)
+            # ROCm uses e4m3fnuz (tl.float8e4b8) for FP8 cache bytes.
+            x_fp8 = x_clamped.to(tl.float8e4b8)
             x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
@@ -272,8 +272,8 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                # Bitcast uint8 back to ROCm e4m3fnuz FP8.
+                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
 
                 # Convert fp8 to float32 for computation
                 x_float = x_fp8.to(tl.float32)

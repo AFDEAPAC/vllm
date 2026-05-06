@@ -928,8 +928,12 @@ def rocm_ref_sparse_attn_prefill(
 
     qf = q.float()
     gathered_kv = kv.index_select(0, indices.flatten()).reshape(s_q, topk, d_qk).float()
+    gathered_kv = torch.nan_to_num(gathered_kv, nan=0.0, posinf=0.0, neginf=0.0)
     scores = qf @ gathered_kv.transpose(1, 2)
     scores *= scale
+    scores = torch.nan_to_num(
+        scores, nan=float("-inf"), posinf=float("inf"), neginf=float("-inf")
+    )
     scores[invalid_mask.unsqueeze(1).expand_as(scores)] = float("-inf")
 
     orig_lse = torch.logsumexp(scores, dim=-1)
