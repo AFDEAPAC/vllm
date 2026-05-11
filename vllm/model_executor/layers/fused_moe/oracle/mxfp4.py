@@ -565,7 +565,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
         and config.routing_method == RoutingMethodType.DeepseekV4
     ):
         import os
-        if os.environ.get("VLLM_DSV4_USE_AITER_FLYDSL_MOE", "0") == "1":
+        if os.environ.get("DSV4_USE_AITER_FLYDSL_MOE", "0") == "1":
             priority_backends = [
                 Mxfp4MoeBackend.AITER_MXFP4_FP8,
                 Mxfp4MoeBackend.AITER_MXFP4_BF16,
