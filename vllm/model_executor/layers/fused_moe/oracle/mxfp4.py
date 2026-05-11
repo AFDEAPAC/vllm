@@ -564,19 +564,11 @@ def select_deepseek_v4_mxfp4_moe_backend(
         current_platform.is_rocm()
         and config.routing_method == RoutingMethodType.DeepseekV4
     ):
-        import os
-        if os.environ.get("DSV4_USE_AITER_FLYDSL_MOE", "0") == "1":
-            priority_backends = [
-                Mxfp4MoeBackend.AITER_MXFP4_FP8,
-                Mxfp4MoeBackend.AITER_MXFP4_BF16,
-                Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU,
-            ]
-        else:
-            priority_backends = [
-                Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU,
-                Mxfp4MoeBackend.TRITON_UNFUSED,
-                Mxfp4MoeBackend.AITER_MXFP4_BF16,
-            ]
+        priority_backends = [
+            Mxfp4MoeBackend.AITER_MXFP4_FP8,
+            Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU,
+        ]
     else:
         priority_backends = _get_priority_backends()
 
