@@ -67,7 +67,7 @@ _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
 
 
 def _should_inline_dequant_wo_a() -> bool:
-    return current_platform.is_rocm()
+    return False
 
 
 def _dequant_fp8_wo_a_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
