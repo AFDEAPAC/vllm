@@ -57,6 +57,60 @@ def vllm_topk_sigmoid(
     return topk_weights, topk_indices
 
 
+def _topk_softplus_sqrt_torch(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    e_score_correction_bias: torch.Tensor | None,
+    input_tokens: torch.Tensor | None,
+    hash_indices_table: torch.Tensor | None,
+) -> None:
+    scores = F.softplus(gating_output.to(torch.float32), beta=1.0, threshold=20.0)
+    scores = torch.sqrt(scores)
+
+    if input_tokens is not None and hash_indices_table is not None:
+        selected_experts = hash_indices_table[input_tokens.to(torch.long)]
+        selected_weights = torch.gather(scores, -1, selected_experts.to(torch.long))
+        if renormalize:
+            denom = selected_weights.sum(dim=-1, keepdim=True)
+            selected_weights = selected_weights / torch.clamp_min(denom, 1e-20)
+        topk_weights.copy_(
+            (selected_weights * routed_scaling_factor).to(topk_weights.dtype)
+        )
+        topk_indices.copy_(selected_experts.to(topk_indices.dtype))
+        return
+
+    if e_score_correction_bias is not None:
+        ranking_scores = scores + e_score_correction_bias.to(torch.float32)
+    else:
+        ranking_scores = scores
+
+    _, topk_ids = torch.topk(ranking_scores, topk_weights.shape[-1], dim=-1)
+    selected_weights = torch.gather(scores, -1, topk_ids)
+    if renormalize:
+        denom = selected_weights.sum(dim=-1, keepdim=True)
+        selected_weights = selected_weights / torch.clamp_min(denom, 1e-20)
+    topk_weights.copy_(
+        (selected_weights * routed_scaling_factor).to(topk_weights.dtype)
+    )
+    topk_indices.copy_(topk_ids.to(topk_indices.dtype))
+
+    arange_t = torch.arange(
+        gating_output.shape[0],
+        device=gating_output.device,
+        dtype=token_expert_indices.dtype,
+    ).unsqueeze(-1)
+    arange_k = torch.arange(
+        topk_weights.shape[-1],
+        device=gating_output.device,
+        dtype=token_expert_indices.dtype,
+    ).unsqueeze(0)
+    token_expert_indices.copy_(arange_k * gating_output.shape[0] + arange_t)
+
+
 def vllm_topk_softplus_sqrt(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -68,17 +122,32 @@ def vllm_topk_softplus_sqrt(
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, ...]:
-    ops.topk_hash_softplus_sqrt(
-        topk_weights,
-        topk_indices,
-        token_expert_indices,
-        gating_output,
-        renormalize,
-        routed_scaling_factor,
-        e_score_correction_bias,
-        input_tokens,
-        hash_indices_table,
-    )
+    from vllm.platforms import current_platform
+
+    if current_platform.is_cuda():
+        ops.topk_hash_softplus_sqrt(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            e_score_correction_bias,
+            input_tokens,
+            hash_indices_table,
+        )
+    else:
+        _topk_softplus_sqrt_torch(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            e_score_correction_bias,
+            input_tokens,
+            hash_indices_table,
+        )
 
     return topk_weights, topk_indices
 
