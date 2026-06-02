@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+import os
 from typing import Any, ClassVar, cast
 
 import torch
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -168,6 +170,52 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return CompressorBackend
+def hadamard_transform_ref(x: torch.Tensor) -> torch.Tensor:
+    hidden_size = x.shape[-1]
+    assert hidden_size > 0 and (hidden_size & (hidden_size - 1)) == 0, (
+        f"Hidden size must be a power of 2, got {hidden_size}"
+    )
+    dtype = x.dtype
+    y = x.to(torch.float32).reshape(-1, hidden_size)
+    h = 1
+    while h < hidden_size:
+        y = y.view(-1, hidden_size // (2 * h), 2, h)
+        a = y[:, :, 0, :]
+        b = y[:, :, 1, :]
+        y = torch.cat((a + b, a - b), dim=-1)
+        h *= 2
+    y = y.view(*x.shape) * (hidden_size**-0.5)
+    return y.to(dtype)
+
+
+def apply_gptj_rope_ref(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_dim: int,
+) -> torch.Tensor:
+    if rope_dim == 0 or x.numel() == 0:
+        return x
+    half_rot = rope_dim // 2
+    nope_dim = x.shape[-1] - rope_dim
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    cache = cos_sin_cache.index_select(0, positions.to(torch.long))
+    cos = cache[:, :half_rot].to(torch.float32)
+    sin = cache[:, half_rot : 2 * half_rot].to(torch.float32)
+    view_shape = (positions.shape[0],) + (1,) * (x.dim() - 2) + (half_rot,)
+    cos = cos.view(view_shape)
+    sin = sin.view(view_shape)
+    rope = x[..., nope_dim:]
+    x_even = rope[..., 0::2]
+    x_odd = rope[..., 1::2]
+    rope_out = torch.stack(
+        (x_even * cos - x_odd * sin, x_odd * cos + x_even * sin),
+        dim=-1,
+    ).flatten(-2)
+    x = x.clone()
+    x[..., nope_dim:] = rope_out
+    return x.to(dtype)
 
 
 class DeepseekCompressor(nn.Module):
@@ -245,6 +293,9 @@ class DeepseekCompressor(nn.Module):
         self._static_forward_context = (
             vllm_config.compilation_config.static_forward_context
         )
+        self._old_kv_state: dict[str, torch.Tensor] = {}
+        self._old_score_state: dict[str, torch.Tensor] = {}
+        self._old_need_hadamard = self.head_dim == 128
 
         if self.head_dim == 512:
             assert not use_fp4_cache, (
@@ -275,6 +326,9 @@ class DeepseekCompressor(nn.Module):
         positions: torch.Tensor,
         rotary_emb,
     ) -> None:
+        # ROCm gfx942: opt-in capture-unsafe correctness fallback.
+        # Default uses cudagraph-safe fused Triton path so FULL decode capture works.
+        import os
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
         kv, score = kv_score.split(
@@ -299,12 +353,7 @@ class DeepseekCompressor(nn.Module):
         state_cache = self.state_cache.kv_cache
         # kv_state stored in first half, score_state stored in second half
         state_width = state_cache.shape[-1] // 2
-        pdl_kwargs = (
-            {}
-            if current_platform.is_rocm() or current_platform.is_xpu()
-            else {"launch_pdl": False}
-        )
-
+        pdl_kwargs = {} if current_platform.is_rocm() else {"launch_pdl": False}
         # Store the KV and score (with fused APE addition) in the state.
         # NOTE: PDL is disabled — both this kernel and the compress kernels
         # below depend on preceding kernel outputs (kv/score from the cublas
@@ -324,13 +373,7 @@ class DeepseekCompressor(nn.Module):
             pdl_kwargs=pdl_kwargs,
         )
 
-        # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
-        # RoPE requirements (kernel applies forward GPT-J style rotation):
-        # - is_neox_style=False (interleaved pairs, NOT split-half)
-        # - cos_sin_cache layout: [max_pos, rope_head_dim] with first half cos,
-        #   second half sin (per-pair, length rope_head_dim // 2 each)
-        # - applied to LAST rope_head_dim elements of head_dim
-        # - position used: (positions // compress_ratio) * compress_ratio
+        # Fused: compress -> RMSNorm -> RoPE -> FP8 quant -> KV cache write.
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
