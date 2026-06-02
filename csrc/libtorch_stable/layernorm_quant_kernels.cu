@@ -18,6 +18,23 @@
 
 namespace vllm {
 
+// Force a float -> scalar_t -> float round-trip whose intermediate scalar_t
+// value cannot be elided by the AMDGPU compiler. This matches the unfused
+// rms_norm + static_scaled_fp8_quant composite at FP8 tie boundaries.
+template <typename scalar_t>
+__device__ __forceinline__ float fp8_quant_round_trip(float v) {
+#if defined(USE_ROCM)
+  if constexpr (std::is_same_v<scalar_t, c10::Half>) {
+    _Float16 h;
+    asm volatile("v_cvt_f16_f32_e32 %0, %1" : "=v"(h) : "v"(v));
+    float r;
+    asm volatile("v_cvt_f32_f16_e32 %0, %1" : "=v"(r) : "v"(h));
+    return r;
+  }
+#endif
+  return static_cast<float>(static_cast<scalar_t>(v));
+}
+
 // TODO(woosuk): Further optimize this kernel.
 template <typename scalar_t, typename fp8_type, int VEC_SIZE>
 __global__ void rms_norm_static_fp8_quant_kernel(
@@ -66,11 +83,26 @@ __global__ void rms_norm_static_fp8_quant_kernel(
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; j++) {
       float x = static_cast<float>(src1.val[j]);
-      // Multiply in weight's native dtype to match rms_norm_kernel.
-      scalar_t out_norm = static_cast<scalar_t>(x * s_variance) * src2.val[j];
+      float w = static_cast<float>(src2.val[j]);
+      // Round normalized result through scalar_t to match the precision of the
+      // unfused composite (rms_norm writes scalar_t, then
+      // static_scaled_fp8_quant re-loads it as float before FP8 conversion).
+      // Without this round, the fused path is strictly more accurate and
+      // disagrees with the composite at exact E4M3 quantization tie boundaries.
+#ifdef USE_ROCM
+      float out_norm_f;
+      if constexpr (VEC_SIZE > 1) {
+        out_norm_f = fp8_quant_round_trip<scalar_t>(x * s_variance * w);
+      } else {
+        scalar_t out_norm = static_cast<scalar_t>(x * s_variance * w);
+        out_norm_f = static_cast<float>(out_norm);
+      }
+#else
+      scalar_t out_norm = static_cast<scalar_t>(x * s_variance * w);
+      float const out_norm_f = static_cast<float>(out_norm);
+#endif
       out[blockIdx.x * hidden_size + idx * VEC_SIZE + j] =
-          scaled_fp8_conversion<true, fp8_type>(static_cast<float>(out_norm),
-                                                scale_inv);
+          scaled_fp8_conversion<true, fp8_type>(out_norm_f, scale_inv);
     }
   }
 }
@@ -137,10 +169,17 @@ fused_add_rms_norm_static_fp8_quant_kernel(
 #pragma unroll
     for (int i = 0; i < width; ++i) {
       float x = Converter::convert(res.data[i]);
-      // Multiply in weight's native dtype to match fused_add_rms_norm_kernel.
-      HipT out_norm_h = Converter::convert(x * s_variance) * w.data[i];
+      float wf = Converter::convert(w.data[i]);
+      // See note in rms_norm_static_fp8_quant_kernel: round through scalar_t
+#ifdef USE_ROCM
+      float const out_norm_f =
+          fp8_quant_round_trip<scalar_t>(x * s_variance * wf);
+#else
+      HipT out_norm_h = Converter::convert(x * s_variance * wf);
+      float const out_norm_f = Converter::convert(out_norm_h);
+#endif
       out[id * width + i] = scaled_fp8_conversion<true, fp8_type>(
-          Converter::convert(out_norm_h), scale_inv);
+          out_norm_f, scale_inv);
     }
   }
 }
