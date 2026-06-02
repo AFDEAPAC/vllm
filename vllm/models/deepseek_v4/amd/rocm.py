@@ -699,12 +699,13 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if layer.compress_ratio == 4:
                 assert layer.topk_indices_buffer is not None
+                decode_topk_source = layer.topk_indices_buffer[:num_decode_tokens]
                 (
                     topk_ragged_indices,
                     topk_ragged_indptr,
                     topk_lens,
                 ) = compute_global_topk_ragged_indices_and_indptr(
-                    layer.topk_indices_buffer[:num_decode_tokens],
+                    decode_topk_source,
                     swa_metadata.token_to_req_indices,
                     attn_metadata.block_table[:num_decodes],
                     block_size,
@@ -736,7 +737,6 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             rope_head_dim=layer.rope_head_dim,
             output=output,
         )
-
     @classmethod
     def _forward_prefill(
         cls,
@@ -797,6 +797,12 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             chunk_start = chunk_idx * cls.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + cls.PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
@@ -811,6 +817,20 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                     offset=0,
                 )
 
+            topk_indices_chunk = topk_indices[query_start:query_end]
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                topk_indices_chunk,
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                layer.window_size,
+                layer.compress_ratio,
+                top_k,
+                M,
+                N,
+            )
             swa_block_table = swa_metadata.block_table[num_decodes:]
             dequantize_and_gather_k_cache(
                 kv[:chunk_size],
