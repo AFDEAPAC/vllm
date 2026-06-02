@@ -531,6 +531,106 @@ def mqa_logits_module():
     return None
 
 
+@functools.lru_cache
+def _fp8_mqa_logits_raw_kernel():
+    # The aiter Python wrapper hardcodes BLOCK_KV=128 + num_stages=2 which
+    # costs ~96 KB of LDS for the DSV4 indexer shape (NUM_HEADS=64,
+    # HEAD_SIZE=128, ieee fp32 accumulator) and overflows gfx942's 64 KB
+    # LDS budget. Resolve the raw Triton kernel so we can call it with an
+    # architecture-aware BLOCK_KV. gfx950 (MI355X, 160 KB LDS) is unaffected.
+    candidates = (
+        "aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits",
+        "aiter.ops.triton._triton_kernels.fp8_mqa_logits",
+    )
+    for path in candidates:
+        if find_spec(path) is None:
+            continue
+        try:
+            module = importlib.import_module(path)
+        except ImportError:
+            continue
+        kernel = getattr(module, "_fp8_mqa_logits_kernel", None)
+        if kernel is not None:
+            return kernel
+    return None
+
+
+def _fp8_mqa_logits_safe(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor | None:
+    """LDS-aware fp8_mqa_logits launcher.
+
+    Calls the underlying aiter Triton kernel directly with BLOCK_KV chosen
+    to fit each target architecture's per-CU LDS budget:
+      * gfx942 (MI300X / MI308): LDS = 64 KB  -> BLOCK_KV = 64,  num_stages = 1
+      * other  (e.g. gfx950)   : LDS >= 128 KB -> BLOCK_KV = 128, num_stages = 2
+
+    Returns `None` if the raw kernel cannot be resolved so the caller can
+    fall back to the aiter wrapper / torch reference path.
+    """
+    kernel = _fp8_mqa_logits_raw_kernel()
+    if kernel is None:
+        return None
+
+    k_fp8, scale = kv
+    seq_len, num_heads, head_size = q.shape
+    seq_len_kv = k_fp8.shape[0]
+
+    if num_heads & (num_heads - 1) != 0 or head_size & (head_size - 1) != 0:
+        # Kernel requires power-of-two NUM_HEADS / HEAD_SIZE; let the caller
+        # fall back rather than fail here.
+        return None
+
+    if _ON_GFX942:
+        BLOCK_KV = 64
+        NUM_STAGES = 1
+    else:
+        BLOCK_KV = 128
+        NUM_STAGES = 2
+
+    logits = torch.full(
+        (seq_len, seq_len_kv),
+        fill_value=-float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    matrix_instr_nonkdim = 16 if seq_len <= 1024 else 32
+
+    kernel[(seq_len,)](
+        Q_ptr=q,
+        KV_ptr=k_fp8,
+        kv_scales_ptr=scale,
+        weights_ptr=weights,
+        cu_start_ptr=cu_seqlen_ks,
+        cu_end_ptr=cu_seqlen_ke,
+        logits_ptr=logits,
+        seq_len=seq_len,
+        seq_len_kv=seq_len_kv,
+        NUM_HEADS=num_heads,
+        HEAD_SIZE=head_size,
+        stride_q_s=q.stride(0),
+        stride_q_h=q.stride(1),
+        stride_q_d=q.stride(2),
+        stride_kv_s=k_fp8.stride(0),
+        stride_kv_d=k_fp8.stride(1),
+        stride_w_s=weights.stride(0),
+        stride_w_h=weights.stride(1),
+        stride_logits_s=logits.stride(0),
+        stride_logits_k=logits.stride(1),
+        BLOCK_KV=BLOCK_KV,
+        num_warps=4,
+        num_stages=NUM_STAGES,
+        waves_per_eu=2,
+        matrix_instr_nonkdim=matrix_instr_nonkdim,
+    )
+    return logits
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -565,6 +665,14 @@ def rocm_fp8_mqa_logits(
         aiter_mqa_logits_module = mqa_logits_module()
 
     if aiter_mqa_logits_module is not None:
+        # Prefer our LDS-aware launcher so gfx942 (MI300X / MI308) uses a
+        # BLOCK_KV=64 / num_stages=1 config that fits in 64 KB of shared
+        # memory. On gfx950 this matches the aiter wrapper defaults.
+        logits = _fp8_mqa_logits_safe(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+        if logits is not None:
+            return logits
+        # Fall back to the aiter wrapper if we could not resolve the raw
+        # kernel (e.g. private module layout changed in a future aiter).
         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
         k_fp8, scale = kv
         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
