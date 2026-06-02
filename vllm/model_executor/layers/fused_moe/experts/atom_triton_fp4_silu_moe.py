@@ -600,14 +600,6 @@ class AtomTritonFP4SiluExperts(mk.FusedMoEExpertsModular):
                     "VLLM_DSV4_MXFP4_ROUTED_KERNEL=1 but routed_mxfp4_kernels "
                     "could not be imported"
                 )
-
-            def _routed_debug_checkpoint(name: str) -> None:
-                torch.cuda.synchronize(hidden_states.device)
-                logger.warning(
-                    "AtomTritonFP4SiluExperts routed-debug-sync: %s M=%d K=%d topk=%d",
-                    name, M, K, topk,
-                )
-
             max_active, metadata_capacity = _get_fixed_metadata_config()
             meta_shape = (local_num_experts, metadata_capacity)
             if (
@@ -647,8 +639,6 @@ class AtomTritonFP4SiluExperts(mk.FusedMoEExpertsModular):
                 CAPACITY=metadata_capacity,
                 BLOCK=1024,
             )
-            _routed_debug_checkpoint("metadata")
-
             route_total = flat_topk_ids.numel()
             gate_up_shape = (route_total, w1.shape[1])
             gate_up_numel = route_total * w1.shape[1]
@@ -674,9 +664,7 @@ class AtomTritonFP4SiluExperts(mk.FusedMoEExpertsModular):
                 routed_gate_up = self._routed_gate_up_2d
                 routed_gate_up_from_workspace = False
 
-            routed_output_fp32 = (
-                torch.empty_like(output_fp32) if routed_compare else output_fp32
-            )
+            routed_output_fp32 = output_fp32
 
             if os.getenv("VLLM_DSV4_MXFP4_ROUTED_RAGGED", "0") == "1":
                 if (
@@ -931,11 +919,7 @@ class AtomTritonFP4SiluExperts(mk.FusedMoEExpertsModular):
                         clamp_limit=clamp_limit,
                         block_m=ragged_block_m,
                     )
-                output.copy_(
-                    output_fp32
-                    if routed_compare and routed_compare_return_baseline
-                    else routed_output_fp32
-                )
+                output.copy_(routed_output_fp32)
                 return
 
             if os.getenv("VLLM_DSV4_MXFP4_ROUTED_PAGED", "0") == "1":
@@ -1009,7 +993,6 @@ class AtomTritonFP4SiluExperts(mk.FusedMoEExpertsModular):
                 flat_token_idx,
                 routed_gate_up,
             )
-            _routed_debug_checkpoint("stage1")
             _routed_mxfp4_stage2_scatter_into(
                 routed_gate_up,
                 w2,
@@ -1021,13 +1004,7 @@ class AtomTritonFP4SiluExperts(mk.FusedMoEExpertsModular):
                 routed_output_fp32,
                 clamp_limit=clamp_limit,
             )
-            _routed_debug_checkpoint("stage2")
-
-            output.copy_(
-                output_fp32
-                if routed_compare and routed_compare_return_baseline
-                else routed_output_fp32
-            )
+            output.copy_(routed_output_fp32)
 
             return
 
