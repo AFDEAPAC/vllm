@@ -76,6 +76,8 @@ class Mxfp4MoeBackend(Enum):
     AITER = "AITER_MXFP4_BF16"
     AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8: triton kernel
     AITER_MXFP4_MXFP4 = "AITER_MXFP4_MXFP4"  # W4A4: CK kernel
+    # Correctness-first ROCm/gfx942 fallback for DeepSeek-V4-Pro MXFP4 experts.
+    ATOM_TRITON_FP4_SILU = "ATOM_TRITON_FP4_SILU"
     # Triton
     TRITON = "TRITON"
     TRITON_UNFUSED = "TRITON_UNFUSED"
@@ -204,6 +206,12 @@ def backend_to_kernel_cls(
         )
 
         return [AiterExperts]
+    elif backend == Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU:
+        from vllm.model_executor.layers.fused_moe.experts.atom_triton_fp4_silu_moe import (
+            AtomTritonFP4SiluExperts,
+        )
+
+        return [AtomTritonFP4SiluExperts]
 
     elif backend == Mxfp4MoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import XPUExpertsMXFp4
@@ -629,6 +637,8 @@ def select_deepseek_v4_mxfp4_moe_backend(
         and config.routing_method == RoutingMethodType.DeepseekV4
     ):
         priority_backends = [
+            Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU,
+            Mxfp4MoeBackend.TRITON_UNFUSED,
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
             Mxfp4MoeBackend.TRITON_UNFUSED,
         ]
@@ -742,6 +752,20 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             getattr(layer, "w13_bias", None),
             getattr(layer, "w2_bias", None),
         )
+    if mxfp4_backend == Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU:
+        if w13_bias is not None:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32)
+        return (
+            w13_weight.data,
+            w2_weight.data,
+            w13_weight_scale.data,
+            w2_weight_scale.data,
+            w13_bias,
+            w2_bias,
+        )
+
     elif mxfp4_backend in (
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
@@ -1282,6 +1306,20 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             getattr(layer, "w2_bias", None),
         )
 
+    if mxfp4_backend == Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU:
+        if w13_bias is not None:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32)
+        return (
+            w13_weight.data,
+            w2_weight.data,
+            w13_weight_scale.data,
+            w2_weight_scale.data,
+            w13_bias,
+            w2_bias,
+        )
+
     if mxfp4_backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
             prepare_moe_mxfp4_layer_for_marlin,
@@ -1621,6 +1659,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
         Mxfp4MoeBackend.CPU,
+        Mxfp4MoeBackend.ATOM_TRITON_FP4_SILU,
     ):
         return mxfp4_w4a16_moe_quant_config(
             w1_bias=w1_bias,
