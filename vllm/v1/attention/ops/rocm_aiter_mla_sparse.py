@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -1020,55 +1021,75 @@ def _sparse_attn_prefill_ragged_kernel(
     out_stride_h,
     out_stride_d,
     num_heads,
-    head_dim,
     num_kv,
     scale,
     HAS_ATTN_SINK: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
 
     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    dim_offsets = tl.arange(0, BLOCK_D)
     head_mask = head_offsets < num_heads
-    dim_mask = dim_offsets < head_dim
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < NOPE_DIM
+    rope_offsets = tl.arange(0, ROPE_DIM)
 
-    q = tl.load(
-        q_ptr
-        + query_idx * q_stride_t
-        + head_offsets[:, None] * q_stride_h
-        + dim_offsets[None, :] * q_stride_d,
-        mask=head_mask[:, None] & dim_mask[None, :],
+    q_row_ptr = q_ptr + query_idx * q_stride_t + head_offsets[:, None] * q_stride_h
+    q_nope = tl.load(
+        q_row_ptr + nope_offsets[None, :] * q_stride_d,
+        mask=head_mask[:, None] & nope_mask[None, :],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        q_row_ptr + (NOPE_DIM + rope_offsets[None, :]) * q_stride_d,
+        mask=head_mask[:, None],
         other=0.0,
     )
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+    acc_nope = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+    acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
 
     kv_start = tl.load(kv_indptr_ptr + query_idx)
     kv_end = tl.load(kv_indptr_ptr + query_idx + 1)
     kv_len = kv_end - kv_start
 
     k_offsets = tl.arange(0, BLOCK_K)
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
         slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0) & (slot < num_kv)
+        safe_slot = tl.where(valid, slot, 0)
 
-        kv = tl.load(
-            kv_ptr + slot[:, None] * kv_stride_n + dim_offsets[None, :] * kv_stride_d,
-            mask=valid[:, None] & dim_mask[None, :],
+        kv_base = kv_ptr + safe_slot[:, None] * kv_stride_n
+        k_nope = tl.load(
+            kv_base + nope_offsets[None, :] * kv_stride_d,
+            mask=valid[:, None] & nope_mask[None, :],
             other=0.0,
         )
-        kv = tl.where(valid[:, None] & dim_mask[None, :], kv, 0.0)
+        k_rope = tl.load(
+            kv_base + (NOPE_DIM + rope_offsets[None, :]) * kv_stride_d,
+            mask=valid[:, None],
+            other=0.0,
+        )
+        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
-        scores = tl.dot(q, tl.trans(kv)) * scale
+        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+        scores *= scale
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
@@ -1078,36 +1099,35 @@ def _sparse_attn_prefill_ragged_kernel(
         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
         m_i = m_new
         l_i = l_new
 
     if HAS_ATTN_SINK:
-        sink = tl.load(
-            attn_sink_ptr + head_offsets, mask=head_mask, other=neg_large
-        ).to(tl.float32)
+        sink = tl.load(attn_sink_ptr + head_offsets, mask=head_mask, other=neg_large).to(tl.float32)
         m_final = tl.maximum(m_i, sink)
         alpha = tl.exp(m_i - m_final)
         l_final = l_i * alpha + tl.exp(sink - m_final)
         denom = tl.maximum(l_final, 1.0e-30)
-        out = tl.where(
-            l_final[:, None] > 0.0,
-            (acc * alpha[:, None]) / denom[:, None],
-            0.0,
-        )
+        out_nope = tl.where(l_final[:, None] > 0.0, (acc_nope * alpha[:, None]) / denom[:, None], 0.0)
+        out_rope = tl.where(l_final[:, None] > 0.0, (acc_rope * alpha[:, None]) / denom[:, None], 0.0)
     else:
         denom = tl.maximum(l_i, 1.0e-30)
-        out = tl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
+        out_nope = tl.where(l_i[:, None] > 0.0, acc_nope / denom[:, None], 0.0)
+        out_rope = tl.where(l_i[:, None] > 0.0, acc_rope / denom[:, None], 0.0)
 
+    out_row_ptr = out_ptr + query_idx * out_stride_t + head_offsets[:, None] * out_stride_h
     tl.store(
-        out_ptr
-        + query_idx * out_stride_t
-        + head_offsets[:, None] * out_stride_h
-        + dim_offsets[None, :] * out_stride_d,
-        out,
-        mask=head_mask[:, None] & dim_mask[None, :],
+        out_row_ptr + nope_offsets[None, :] * out_stride_d,
+        out_nope,
+        mask=head_mask[:, None] & nope_mask[None, :],
     )
-
+    tl.store(
+        out_row_ptr + (NOPE_DIM + rope_offsets[None, :]) * out_stride_d,
+        out_rope,
+        mask=head_mask[:, None],
+    )
 
 @triton.jit
 def _sparse_attn_decode_ragged_kernel(
@@ -1195,7 +1215,7 @@ def _sparse_attn_decode_ragged_kernel(
             other=0,
         )
         if IS_FNUZ:
-            x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
         else:
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
         encoded_scales = tl.load(
@@ -1263,7 +1283,7 @@ def _sparse_attn_decode_ragged_kernel(
                 other=0,
             )
             if IS_FNUZ:
-                x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
             else:
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
             encoded_scales = tl.load(
@@ -1378,7 +1398,6 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     )
 
     block_h = 16
-    block_d = triton.next_power_of_2(head_dim)
     block_k = 16 if head_dim >= 256 else 32
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
@@ -1397,12 +1416,13 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         out.stride(1),
         out.stride(2),
         num_heads,
-        head_dim,
         kv.shape[0],
         float(scale),
         HAS_ATTN_SINK=has_attn_sink,
+        NOPE_DIM=nope_head_dim,
+        NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
+        ROPE_DIM=rope_head_dim,
         BLOCK_H=block_h,
-        BLOCK_D=block_d,
         BLOCK_K=block_k,
         num_warps=8,
     )
@@ -1602,6 +1622,56 @@ def _rocm_sparse_attn_decode_triton(
     )
 
 
+
+def rocm_ref_sparse_attn_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor | None,
+    scale: float,
+    head_dim: int,
+    attn_sink: torch.Tensor | None,
+) -> torch.Tensor:
+    indices = indices.clone().squeeze(1)
+    s_q, h_q, d_qk = q.shape
+    topk = indices.shape[-1]
+    s_kv = kv.shape[0]
+    if topk_length is not None:
+        mask = torch.arange(topk, device=indices.device).unsqueeze(0) >= topk_length.unsqueeze(1)
+        indices[mask] = -1
+    q_chunk_size = int(os.environ.get('VLLM_DSV4_REF_PREFILL_Q_CHUNK', '128'))
+    if q_chunk_size > 0 and s_q > q_chunk_size:
+        out = torch.empty((s_q, h_q, head_dim), dtype=torch.bfloat16, device=q.device)
+        for chunk_start in range(0, s_q, q_chunk_size):
+            chunk_end = min(chunk_start + q_chunk_size, s_q)
+            chunk_topk_length = topk_length[chunk_start:chunk_end] if topk_length is not None else None
+            out[chunk_start:chunk_end] = rocm_ref_sparse_attn_prefill(
+                q=q[chunk_start:chunk_end], kv=kv,
+                indices=indices[chunk_start:chunk_end].unsqueeze(1),
+                topk_length=chunk_topk_length, scale=scale,
+                head_dim=head_dim, attn_sink=attn_sink)
+        return out
+    invalid_mask = (indices < 0) | (indices >= s_kv)
+    indices[invalid_mask] = 0
+    qf = q.float()
+    gathered_kv = kv.index_select(0, indices.flatten()).reshape(s_q, topk, d_qk).float()
+    gathered_kv = torch.nan_to_num(gathered_kv, nan=0.0, posinf=0.0, neginf=0.0)
+    scores = qf @ gathered_kv.transpose(1, 2)
+    scores *= scale
+    scores = torch.nan_to_num(scores, nan=float('-inf'), posinf=float('inf'), neginf=float('-inf'))
+    scores[invalid_mask.unsqueeze(1).expand_as(scores)] = float('-inf')
+    orig_lse = torch.logsumexp(scores, dim=-1)
+    lse_for_o = orig_lse
+    if attn_sink is not None:
+        lse_for_o = torch.logsumexp(torch.stack([orig_lse, attn_sink[:h_q].view(1, h_q).expand_as(orig_lse)], dim=0), dim=0)
+    lse_for_o = lse_for_o.clone()
+    lse_for_o[lse_for_o == float('-inf')] = float('+inf')
+    probs = torch.exp(scores - lse_for_o.unsqueeze(-1))
+    out = probs @ gathered_kv[..., :head_dim]
+    lonely_q_mask = orig_lse == float('-inf')
+    out[lonely_q_mask.unsqueeze(-1).expand_as(out)] = 0.0
+    return out.to(torch.bfloat16)
+
 def rocm_sparse_attn_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1625,7 +1695,37 @@ def rocm_sparse_attn_prefill(
         rope_head_dim,
         "rocm_sparse_attn_prefill",
     )
-    if ragged_indices is not None and ragged_indptr is not None:
+
+    def _dense_indices_for_ref() -> tuple[torch.Tensor, torch.Tensor | None]:
+        if ragged_indices is not None and ragged_indptr is not None:
+            lens = (ragged_indptr[1:] - ragged_indptr[:-1]).to(torch.int32)
+            max_len = int(lens.max().item()) if lens.numel() else 0
+            dense = torch.full(
+                (lens.numel(), max(max_len, 1)),
+                -1,
+                dtype=ragged_indices.dtype,
+                device=ragged_indices.device,
+            )
+            for row in range(lens.numel()):
+                st = int(ragged_indptr[row].item())
+                en = int(ragged_indptr[row + 1].item())
+                if en > st:
+                    dense[row, : en - st] = ragged_indices[st:en]
+            return dense.unsqueeze(1), lens
+        return indices, topk_length
+
+    if os.environ.get("VLLM_DSV4_PREFILL_FORCE_REF", "0") == "1":
+        indices_for_ref, topk_for_ref = _dense_indices_for_ref()
+        output_chunk = rocm_ref_sparse_attn_prefill(
+            q=q,
+            kv=kv.squeeze(1),
+            indices=indices_for_ref,
+            topk_length=topk_for_ref,
+            scale=scale,
+            head_dim=head_dim,
+            attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+        )
+    elif ragged_indices is not None and ragged_indptr is not None:
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
             kv=kv.squeeze(1),
@@ -1648,8 +1748,60 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
             topk_length=topk_length,
         )
-    output.copy_(output_chunk.to(output.dtype))
 
+    if os.environ.get("VLLM_DSV4_PREFILL_COMPARE", "0") == "1":
+        indices_for_ref, topk_for_ref = _dense_indices_for_ref()
+        ref_chunk = rocm_ref_sparse_attn_prefill(
+            q=q,
+            kv=kv.squeeze(1),
+            indices=indices_for_ref,
+            topk_length=topk_for_ref,
+            scale=scale,
+            head_dim=head_dim,
+            attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+        )
+        diff = (output_chunk.to(torch.float32) - ref_chunk.to(torch.float32)).abs()
+        bad1 = (diff > 1e-1).float().mean().item() if diff.numel() else 0.0
+        bad2 = (diff > 1e-2).float().mean().item() if diff.numel() else 0.0
+        print(
+            "DSV4_PREFILL_COMPARE "
+            f"force_ref={os.environ.get('VLLM_DSV4_PREFILL_FORCE_REF', '0')} "
+            f"q_shape={tuple(q.shape)} kv_shape={tuple(kv.shape)} "
+            f"max_abs={diff.max().item() if diff.numel() else 0.0:.6g} "
+            f"mean_abs={diff.mean().item() if diff.numel() else 0.0:.6g} "
+            f"bad>1e-1={bad1:.6g} bad>1e-2={bad2:.6g} "
+            f"out_std={output_chunk.to(torch.float32).std().item():.6g} "
+            f"ref_std={ref_chunk.to(torch.float32).std().item():.6g}",
+            flush=True,
+        )
+        if os.environ.get("VLLM_DSV4_PREFILL_COMPARE_HEADS", "0") == "1":
+            out_f = output_chunk.to(torch.float32)
+            ref_f = ref_chunk.to(torch.float32)
+            # Per-head RMS norm over query tokens and hidden dim.
+            out_norm = out_f.square().mean(dim=(0, 2)).sqrt()
+            ref_norm = ref_f.square().mean(dim=(0, 2)).sqrt()
+            ratio = out_norm / torch.clamp(ref_norm, min=1e-12)
+            # Per-head absolute error.
+            head_max = diff.amax(dim=(0, 2))
+            head_mean = diff.mean(dim=(0, 2))
+            score = torch.maximum(ratio, 1.0 / torch.clamp(ratio, min=1e-12))
+            k = min(8, score.numel())
+            vals, idxs = torch.topk(score, k)
+            entries = []
+            for rank in range(k):
+                h = int(idxs[rank].item())
+                entries.append(
+                    f"h={h}:ratio={ratio[h].item():.6g}:"
+                    f"out={out_norm[h].item():.6g}:ref={ref_norm[h].item():.6g}:"
+                    f"max={head_max[h].item():.6g}:mean={head_mean[h].item():.6g}"
+                )
+            print(
+                "DSV4_PREFILL_HEAD_COMPARE "
+                f"q_shape={tuple(q.shape)} kv_shape={tuple(kv.shape)} "
+                + " ".join(entries),
+                flush=True,
+            )
+    output.copy_(output_chunk.to(output.dtype))
 
 def rocm_sparse_attn_decode(
     q: torch.Tensor,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -22,9 +23,13 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
-from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_and_gather_k_cache
+from vllm.v1.attention.ops.deepseek_v4_ops import (
+    combine_topk_swa_indices,
+    dequantize_and_gather_k_cache,
+)
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
+    rocm_ref_sparse_attn_prefill,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
 )
@@ -579,12 +584,15 @@ class DeepseekV4ROCMAiterMLASparseImpl(
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if layer.compress_ratio == 4:
                 assert layer.topk_indices_buffer is not None
+                decode_topk_source = layer.topk_indices_buffer[:num_decode_tokens]
+                if os.environ.get("VLLM_DSV4_MLA_TOPK_CLONE", "0") == "1":
+                    decode_topk_source = decode_topk_source.clone()
                 (
                     topk_ragged_indices,
                     topk_ragged_indptr,
                     topk_lens,
                 ) = compute_global_topk_ragged_indices_and_indptr(
-                    layer.topk_indices_buffer[:num_decode_tokens],
+                    decode_topk_source,
                     swa_metadata.token_to_req_indices,
                     attn_metadata.block_table[:num_decodes],
                     block_size,
@@ -595,6 +603,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(
                 topk_lens = attn_metadata.c128a_decode_topk_lens
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
+
 
         rocm_sparse_attn_decode(
             q=q,
@@ -652,6 +661,8 @@ class DeepseekV4ROCMAiterMLASparseImpl(
                 assert layer.topk_indices_buffer is not None
                 topk_indices = layer.topk_indices_buffer[num_decode_tokens:]
                 topk_indices = topk_indices[:num_prefill_tokens]
+                if os.environ.get("VLLM_DSV4_MLA_TOPK_CLONE", "0") == "1":
+                    topk_indices = topk_indices.clone()
             else:
                 assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
@@ -661,6 +672,8 @@ class DeepseekV4ROCMAiterMLASparseImpl(
         else:
             assert layer.topk_indices_buffer is not None
             topk_indices = layer.topk_indices_buffer[num_decode_tokens:]
+            if os.environ.get("VLLM_DSV4_MLA_TOPK_CLONE", "0") == "1":
+                topk_indices = topk_indices.clone()
             top_k = 0
             N = 0
 
@@ -669,14 +682,29 @@ class DeepseekV4ROCMAiterMLASparseImpl(
             cls._PREFILL_CHUNK_SIZE
         )
 
-        workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((cls._PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        if os.environ.get("VLLM_DSV4_MLA_PREFILL_FRESH_KV_WORKSPACE", "0") == "1":
+            kv = torch.empty(
+                (cls._PREFILL_CHUNK_SIZE, M, q.shape[-1]),
+                device=q.device,
+                dtype=torch.bfloat16,
+            )
+        else:
+            workspace_manager = current_workspace_manager()
+            kv = workspace_manager.get_simultaneous(
+                ((cls._PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )[0]
+        if os.environ.get("VLLM_DSV4_MLA_PREFILL_ZERO_KV_WORKSPACE", "0") == "1":
+            kv.zero_()
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * cls._PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + cls._PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
@@ -691,6 +719,32 @@ class DeepseekV4ROCMAiterMLASparseImpl(
                     offset=0,
                 )
 
+            trace_gather_stage = (
+                os.environ.get("VLLM_DSV4_MLA_PREFILL_COMPARE_REF", "0") == "1"
+                and (
+                    os.environ.get(
+                        "VLLM_DSV4_MLA_PREFILL_COMPARE_LAYER0_ONLY", "1"
+                    )
+                    == "0"
+                    or _layer_id_for_chunk == 0
+                )
+            )
+            topk_indices_chunk = topk_indices[query_start:query_end]
+
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                topk_indices_chunk,
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                layer.window_size,
+                layer.compress_ratio,
+                top_k,
+                M,
+                N,
+            )
+
             swa_block_table = swa_metadata.block_table[num_decodes:]
             dequantize_and_gather_k_cache(
                 kv[:chunk_size],
@@ -702,48 +756,77 @@ class DeepseekV4ROCMAiterMLASparseImpl(
                 offset=N,
             )
 
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            q_arg = q[query_start:query_end]
+            kv_arg = kv.view(-1, 1, q.shape[-1])
+            indices_arg = combined_indices.unsqueeze(1)
+            lens_arg = combined_lens
+            if os.environ.get("VLLM_DSV4_MLA_PREFILL_CLONE_INPUTS", "0") == "1":
+                q_arg = q_arg.clone()
+                kv_arg = kv_arg.clone()
+                indices_arg = indices_arg.clone()
+                lens_arg = lens_arg.clone()
+            output_arg = output[query_start:query_end]
+            if os.environ.get("VLLM_DSV4_MLA_PREFILL_ZERO_OUTPUT", "0") == "1":
+                output_arg.zero_()
+            fallback_mode = os.environ.get(
+                "VLLM_DSV4_MLA_PREFILL_FALLBACK_MODE", "reference"
+            ).strip().lower()
+            use_layer0_fallback = (
+                os.environ.get("VLLM_DSV4_MLA_PREFILL_LAYER0_FALLBACK", "0") == "1"
+                and _layer_id_for_fallback == 0
             )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            use_all_fallback = (
+                os.environ.get("VLLM_DSV4_MLA_PREFILL_ALL_FALLBACK", "0") == "1"
             )
-
-            combined_ragged_indices, combined_ragged_indptr, combined_lens = (
-                combine_topk_swa_indices_ragged(
-                    topk_indices[query_start:query_end],
-                    query_start_loc[
-                        num_decodes + chunk_start : num_decodes + chunk_end + 1
-                    ],
-                    seq_lens[chunk_start:chunk_end],
-                    gather_lens[chunk_start:chunk_end],
-                    layer.window_size,
-                    layer.compress_ratio,
-                    top_k,
-                    M,
-                    N,
+            if (
+                (use_layer0_fallback or use_all_fallback)
+                and fallback_mode in ("reference", "alternate", "eager_boundary")
+            ):
+                output_arg.copy_(
+                    rocm_ref_sparse_attn_prefill(
+                        q=q_arg,
+                        kv=kv_arg,
+                        indices=indices_arg,
+                        topk_length=lens_arg,
+                        scale=layer.scale,
+                        head_dim=layer.head_dim,
+                        attn_sink=layer.attn_sink,
+                    )
                 )
+            else:
+                rocm_sparse_attn_prefill(
+                    q=q_arg,
+                    kv=kv_arg,
+                    indices=indices_arg,
+                    topk_length=lens_arg,
+                    scale=layer.scale,
+                    head_dim=layer.head_dim,
+                    nope_head_dim=layer.nope_head_dim,
+                    rope_head_dim=layer.rope_head_dim,
+                    attn_sink=layer.attn_sink,
+                    output=output_arg,
+                )
+            compare_ref = (
+                os.environ.get("VLLM_DSV4_MLA_PREFILL_COMPARE_REF", "0") == "1"
             )
-            rocm_sparse_attn_prefill(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=torch.empty(
-                    q[query_start:query_end].shape[0],
-                    1,
-                    0,
-                    dtype=torch.int32,
-                    device=q.device,
-                ),
-                topk_length=combined_lens,
-                scale=layer.scale,
-                head_dim=layer.head_dim,
-                nope_head_dim=layer.nope_head_dim,
-                rope_head_dim=layer.rope_head_dim,
-                attn_sink=layer.attn_sink,
-                output=output[query_start:query_end],
-                ragged_indices=combined_ragged_indices,
-                ragged_indptr=combined_ragged_indptr,
+            compare_layer0_only = (
+                os.environ.get(
+                    "VLLM_DSV4_MLA_PREFILL_COMPARE_LAYER0_ONLY", "1"
+                )
+                != "0"
             )
+            if compare_ref and (
+                not compare_layer0_only or _layer_id_for_fallback == 0
+            ):
+                ref_output = rocm_ref_sparse_attn_prefill(
+                    q=q_arg.clone(),
+                    kv=kv_arg.clone(),
+                    indices=indices_arg.clone(),
+                    topk_length=lens_arg.clone(),
+                    scale=layer.scale,
+                    head_dim=layer.head_dim,
+                    attn_sink=layer.attn_sink,
+                )
 
 
 class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4FlashMLASparseBackend):
