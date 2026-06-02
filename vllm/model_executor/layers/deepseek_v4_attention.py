@@ -5,6 +5,7 @@ DeepseekV4 MLA Attention Layer
 """
 
 from collections.abc import Callable
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -29,6 +30,9 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_q_kv_rmsnorm,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
+
+
+
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -315,7 +319,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.o_lora_rank,
                 self.wo_a,
             )
-            return self.wo_b(z.flatten(1))
+            wo_b_out = self.wo_b(z.flatten(1))
+            return wo_b_out
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
@@ -430,6 +435,26 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.kv_norm.weight.data,
             self.eps,
         )
+        if os.environ.get("VLLM_DSV4_ATTN_SAVE_PARAMS", "0") == "1" and "layers.0" in self.layer_name:
+            save_dir = os.environ.get("VLLM_DSV4_ATTN_SAVE_TAIL_DIR", "/tmp/dsv4_attn_tail")
+            os.makedirs(save_dir, exist_ok=True)
+            if os.environ.get("LOCAL_RANK", "0") in ("0", ""):
+                try:
+                    entries = []
+                    for n, t in self.wq_b.named_parameters(recurse=True):
+                        entries.append(("param_" + n, t))
+                    for n, t in self.wq_b.named_buffers(recurse=True):
+                        entries.append(("buffer_" + n, t))
+                    try:
+                        rank = torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+                    except Exception:
+                        rank = -1
+                    for n, t in entries:
+                        safe = n.replace(".", "_")
+                        torch.save(t.detach().cpu(), os.path.join(save_dir, f"layer0_wq_b_rank{rank}_{safe}.pt"))
+                    print(f"DSV4_ATTN_PARAM_DUMP layer0 rank={rank} wq_b entries=" + ",".join(n for n, _ in entries), flush=True)
+                except Exception as exc:
+                    print(f"DSV4_ATTN_PARAM_DUMP failed all: {exc}", flush=True)
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -445,6 +470,22 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def wq_b_kv_insert_and_compress() -> torch.Tensor:
+                if os.environ.get("VLLM_DSV4_ATTN_SAVE_PARAMS", "0") == "1" and "layers.0" in self.layer_name:
+                    save_dir = os.environ.get("VLLM_DSV4_ATTN_SAVE_TAIL_DIR", "/tmp/dsv4_attn_tail")
+                    os.makedirs(save_dir, exist_ok=True)
+                    if os.environ.get("LOCAL_RANK", "0") in ("0", ""):
+                        try:
+                            torch.save(self.wq_b.weight.detach().cpu(), os.path.join(save_dir, "layer0_wq_b_weight.pt"))
+                        except Exception as exc:
+                            print(f"DSV4_ATTN_PARAM_DUMP failed weight: {exc}", flush=True)
+                        for attr in ("weight_scale", "weight_scale_inv", "input_scale"):
+                            val = getattr(self.wq_b, attr, None)
+                            if val is not None:
+                                try:
+                                    torch.save(val.detach().cpu(), os.path.join(save_dir, f"layer0_wq_b_{attr}.pt"))
+                                except Exception as exc:
+                                    print(f"DSV4_ATTN_PARAM_DUMP failed {attr}: {exc}", flush=True)
+                        print("DSV4_ATTN_PARAM_DUMP layer0 wq_b saved", flush=True)
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 compressor(kv_score, positions, self.rotary_emb)
@@ -536,6 +577,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+
 
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
@@ -1185,4 +1227,5 @@ class DeepseekV4Indexer(nn.Module):
             self.n_head**-0.5,
             use_fp4=self.use_fp4_kv,
         )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        result = self.indexer_op(hidden_states, q_quant, k, weights)
+        return result
