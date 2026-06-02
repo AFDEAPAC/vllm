@@ -125,7 +125,11 @@ def normalize_e4m3fn_to_e4m3fnuz(
     # the e4m3fn value, so we should double the scaling factor to
     # get the same dequantized value.
     # https://onnx.ai/onnx/technical/float8.html
-    weight_scale = weight_scale * 2.0
+    # Note: cast to fp32 first because PyTorch mul_cuda is not
+    # implemented for Float8_e8m0fnu (used by MXFP4 scale storage).
+    weight_scale_dtype = weight_scale.dtype
+    weight_scale = (weight_scale.to(torch.float32) * 2.0).to(weight_scale_dtype)
     if input_scale is not None:
-        input_scale = input_scale * 2.0
+        input_scale_dtype = input_scale.dtype
+        input_scale = (input_scale.to(torch.float32) * 2.0).to(input_scale_dtype)
     return weight, weight_scale, input_scale
