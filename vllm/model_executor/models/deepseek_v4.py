@@ -1299,6 +1299,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
+        x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
         residual, post_mix, res_mix, x = torch.ops.vllm.mhc_fused_post_pre(
@@ -1316,6 +1317,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
         )
 
+        x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
@@ -1496,6 +1498,7 @@ class DeepseekV4Model(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
